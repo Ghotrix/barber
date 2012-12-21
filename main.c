@@ -1,15 +1,20 @@
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/times.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 #define MAX_RAND 3000000
-#define MICRO_SLEEP 100000 /* Time interval 1 msec */
+#define MICRO_SLEEP 100 /* Time interval 1/1000 msec */
+#define CLIENTS_NUM 16
 
 typedef struct {
-	int client_number;
+	double waiting_time;
+	int client_num;
+	int is_ready;
+	void *barber;
 } _client;
 
 typedef struct {
@@ -17,123 +22,173 @@ typedef struct {
 	int chaires_number;
 	int time_to_wait;
 	int queue_length;
-	_client *client;
-} barbershop;
+	_client *clients;
+} _barber;
 
 void usage();
-int init_data(int argc, char *argv[], barbershop *data);
-void *barber_cuts(void *arg);
+int init_data(int argc, char *argv[], _barber *data);
+
+void *barber_f(void *arg);
+void *client_f(void *arg);
+
 const char *get_time();
 
-pthread_mutex_t barber_mutex, queue_mutex, sleeping_mutex, time_mutex;
+pthread_mutex_t barber_mutex = PTHREAD_MUTEX_INITIALIZER,
+				queue_mutex = PTHREAD_MUTEX_INITIALIZER, 
+				sleeping_mutex = PTHREAD_MUTEX_INITIALIZER, 
+				client_mutex[CLIENTS_NUM];
 
 int main(int argc, char * argv[]) {
+	char buf[9];
 	int ret = 0;
-	pthread_t thread;
-	barbershop data;
-	
-	data.chaires_number = 0;
-	data.time_to_wait = 0;
-	data.queue_length = 0;
-	data.sleeping = 1;
+	pthread_t barber_thread;
+	pthread_t client_threads[CLIENTS_NUM];
+	_barber barber;
+	_client	clients[CLIENTS_NUM];
 
-	ret = init_data(argc, argv, &data);
+	
+	barber.chaires_number = 0;
+	barber.time_to_wait = 0;
+	barber.queue_length = 0;
+	barber.sleeping = 1;
+	printf("%s Barber is sleeping.\n", get_time(buf));
+	barber.clients = clients;
+
+	ret = init_data(argc, argv, &barber);
 	if (ret < 0)
 		return ret;
 
 	srand(time(NULL));
 	
-	int client_counter = 0;
-	for (;;) {
-		_client *client = malloc(sizeof(_client));
-		client->client_number = ++client_counter;
-		data.client = client;
-		pthread_create(&thread, NULL, barber_cuts, (void *)&data);
-		usleep(rand() % (MAX_RAND - 1000000));
+	for (int i = 0; i < CLIENTS_NUM; i++) {
+		clients[i].client_num = i + 1;
+		clients[i].waiting_time = 0;
+		clients[i].is_ready = 0;
+		clients[i].barber = &barber;
+		pthread_mutex_init(&client_mutex[i], NULL);// = PTHREAD_MUTEX_INITIALIZER;
+
+		pthread_create(&client_threads[i], NULL, client_f, (void *)&clients[i]);
 	}
-	
+
+	pthread_create(&barber_thread, NULL, barber_f, (void *)&barber);
+
+	pthread_join(barber_thread, NULL);
+
 	return 0;
 }
 
-void *barber_cuts(void *arg)
+void *client_f(void *arg)
 {
 	char buf[9];
-	barbershop *barb = (barbershop *)arg;
-	int ret = 0;
-	int client_number = barb->client->client_number;
-	pthread_mutex_lock(&sleeping_mutex);
-	if (barb->sleeping)
-		printf("%s Barber is sleeping.\n", get_time(buf));
-	pthread_mutex_unlock(&sleeping_mutex);
 
-	pthread_mutex_lock(&queue_mutex); 
-		printf("%s Client %d comes to barbershop. Queue length: %d\n", get_time(buf), client_number, barb->queue_length);
-	pthread_mutex_unlock(&queue_mutex);
+	_client *client = (_client *)arg;
+	_barber *barber = client->barber;
 
-	int time = 0;
-	int client_waiting = 0;
+	usleep(MAX_RAND * client->client_num + rand() % (MAX_RAND - 2000000));
+	
 	for (;;) {
-		ret = pthread_mutex_trylock(&barber_mutex);
-		if (ret != 0 && client_waiting == 0) {
-			pthread_mutex_lock(&queue_mutex);
-			if (barb->queue_length == barb->chaires_number) {
-				printf("There are no free chairs. Client %d is leaving.\n", client_number);
-				free(barb->client);
-				pthread_exit((void *) 1);
-			}
-			else {
-				barb->queue_length++;
-				client_waiting = 1;
-				printf("Client %d sits at chair. Queue length: %d\n", client_number, barb->queue_length);
-			};
-			pthread_mutex_unlock(&queue_mutex);
-		}
-		else if (ret == 0) {
-			//pthread_mutex_unlock(&barber_mutex);
-			break;
-		}
+		pthread_yield();
 		
-		if (time >= barb->time_to_wait) {
-			pthread_mutex_lock(&queue_mutex);
-				barb->queue_length--;
-				printf("Client %d don't want to wait anymore, he`s leaving. Queue length: %d\n", client_number, barb->queue_length);
-			pthread_mutex_unlock(&queue_mutex);
-			free(barb->client);
-			pthread_exit((void *) 1);
+		pthread_mutex_lock(&client_mutex[client->client_num]);
+		pthread_mutex_lock(&queue_mutex); 
+		printf("%s Client %d comes to barbershop. Queue length: %d\n", get_time(buf), client->client_num, barber->queue_length);
+		pthread_mutex_unlock(&queue_mutex);
+		
+		int ret;
+		struct tms start_t, current_t;
+		int is_leaving = 0, is_waiting = 0;
+		for (;;) {
+			ret = pthread_mutex_trylock(&barber_mutex);
+			if (ret != 0 && is_waiting == 0) {
+				times(&start_t);
+				pthread_mutex_lock(&queue_mutex);
+				if (barber->queue_length == barber->chaires_number) {
+					printf("%s There are no free chairs. Client %d is leaving.\n", get_time(buf), client->client_num);
+					is_leaving = 1;
+					break;
+				}
+				else {
+					barber->queue_length++;
+					printf("%s Client %d sits at chair. Queue length: %d\n", get_time(buf), client->client_num, barber->queue_length);
+					is_waiting = 1;
+				};
+				pthread_mutex_unlock(&queue_mutex);
+			}
+			else if (ret == 0) {
+				if (is_waiting) {
+					pthread_mutex_lock(&queue_mutex);
+					barber->queue_length--;
+					pthread_mutex_unlock(&queue_mutex);
+				}
+				pthread_mutex_lock(&sleeping_mutex);
+				if (barber->sleeping) {
+					printf("%s Client %d waking up barber.\n", get_time(buf), client->client_num);
+					barber->sleeping = 0;
+				}
+				pthread_mutex_unlock(&sleeping_mutex);
+				client->is_ready = 1;
+				break;
+			}
+		
+			times(&current_t);
+			//pthread_mutex_lock(&time_mutex[client->client_num - 1]);
+			client->waiting_time = (current_t.tms_utime - start_t.tms_utime) + (current_t.tms_stime - start_t.tms_stime);
+			
+			if (client->waiting_time / sysconf(_SC_CLK_TCK) > barber->time_to_wait) {
+				pthread_mutex_lock(&queue_mutex);
+				barber->queue_length--;
+				printf("%s Client %d don't want to wait anymore, he`s leaving. Queue length: %d\n", get_time(buf), client->client_num, barber->queue_length);
+				pthread_mutex_unlock(&queue_mutex);
+				is_leaving = 1;
+			}
+			//pthread_mutex_unlock(&time_mutex[client->client_num - 1]);
+
+			if (is_leaving) {
+				pthread_mutex_unlock(&client_mutex[client->client_num]);
+				break;
+			}
 		}
 
-		time += MICRO_SLEEP;
-		usleep(MICRO_SLEEP);
-	}
-	
-	pthread_mutex_lock(&sleeping_mutex);
-	if (barb->sleeping) {
-		printf("%s Client %d waking up barber.\n", get_time(buf), client_number);
-		barb->sleeping = 0;
-	}
-	pthread_mutex_unlock(&sleeping_mutex);
-	
-	pthread_mutex_lock(&queue_mutex);
-	//pthread_mutex_lock(&barber_mutex);
-	printf("%s Client %d sits for haircut. Queue length: %d\n", get_time(buf), client_number, barb->queue_length);
-	usleep(rand() % MAX_RAND);
-	pthread_mutex_lock(&sleeping_mutex);
-	printf("%s Client %d had it's haircut and leaving barbershop.\n", get_time(buf), client_number);
-	pthread_mutex_unlock(&barber_mutex);
-	pthread_mutex_unlock(&queue_mutex);
-	
-	pthread_mutex_lock(&queue_mutex); 
-		if (barb->queue_length == 0) {
-			barb->sleeping = 1;
-		}
-	pthread_mutex_unlock(&sleeping_mutex);
-	pthread_mutex_unlock(&queue_mutex);
+		//pthread_mutex_lock(&time_mutex[client->client_num - 1]);
+		client->waiting_time = 0;
+		//pthread_mutex_unlock(&time_mutex[client->client_num - 1]);
 
-	free(barb->client);
+		usleep(rand() % (MAX_RAND * CLIENTS_NUM));
+	}
+}
+
+void *barber_f(void *arg)
+{
+	char buf[9];
+	_barber *barber = (_barber *)arg;
+	for (;;) {
+		for (int i = 0; i < CLIENTS_NUM; i++) {
+			if (barber->clients[i].is_ready) {
+				barber->clients[i].is_ready = 0;
+				pthread_mutex_lock(&queue_mutex);
+				printf("%s Client %d sits for haircut. Queue length: %d\n", get_time(buf), i + 1, barber->queue_length);
+				pthread_mutex_unlock(&queue_mutex);
+				usleep(rand() % MAX_RAND);
+				printf("%s Client %d had it's haircut and leaving barbershop.\n", get_time(buf), i + 1);
+				pthread_mutex_unlock(&client_mutex[i]);
+				pthread_mutex_unlock(&barber_mutex);
+
+				pthread_mutex_lock(&queue_mutex);
+				pthread_mutex_lock(&sleeping_mutex);
+				if (barber->queue_length == 0) {
+					barber->sleeping = 1;
+					printf("%s Barber is sleeping.\n", get_time(buf));
+				}
+				pthread_mutex_unlock(&sleeping_mutex);
+				pthread_mutex_unlock(&queue_mutex);
+			}
+		}
+	}
+	
 	pthread_exit((void *) 0);
 }
 
-int init_data(int argc, char *argv[], barbershop *data)
+int init_data(int argc, char *argv[], _barber *data)
 {
 	if (argc < 5) {
 		usage();
