@@ -217,7 +217,7 @@ void usage()
 	printf("\t-n\tnumber of chaires, must be greater than 0\n");
 	printf("\t-t\ttime of clients waiting before he leaves, also greater than 0\n");
 }
-
+/* Useful comment.*/
 const char *get_time(char *buf)
 {
 	struct timespec _tp;
